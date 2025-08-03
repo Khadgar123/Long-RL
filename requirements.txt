@@ -15,7 +15,7 @@ ray[default]
 tensordict
 torchdata
 transformers==4.52.4
-flash-attn>=2.4.3
+flash-attn==2.7.3
 vllm==0.9.1
 wandb
 decord
