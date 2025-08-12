@@ -138,7 +138,6 @@ class vLLMRollout(BaseRollout):
             model=model_path,
             skip_tokenizer_init=False,
             trust_remote_code=config.trust_remote_code,
-            load_format="dummy",
             dtype=PrecisionType.to_str(PrecisionType.to_dtype(config.dtype)),
             seed=config.seed,
             distributed_executor_backend="external_launcher",
@@ -150,6 +149,7 @@ class vLLMRollout(BaseRollout):
             disable_custom_all_reduce=True,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_sleep_mode=True,
+            **({"load_format": "dummy"} if not self.vila_model else {}),
             **engine_kwargs,
         )
 
