@@ -481,7 +481,7 @@ class RLHFDataset(Dataset):
         example["position_ids"] = position_ids
         answer = example.pop(self.answer_key)
         if "<answer>" in answer:
-            match = re.search(r"<answer>(.*?)</answer>", answer)
+            match = re.search(r"<answer>(.*?)</answer>", answer, re.DOTALL)
             example["ground_truth"] = match.group(1)
         else:
             example["ground_truth"] = answer

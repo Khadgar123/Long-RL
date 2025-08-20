@@ -32,14 +32,14 @@ def accuracy_reward(completions, solution, **kwargs):
         if reward == 0.0:
             try:
                 # Extract answer from solution if it has think/answer tags
-                sol_match = re.search(r"<answer>(.*?)</answer>", sol)
+                sol_match = re.search(r"<answer>(.*?)</answer>", sol, re.DOTALL)
                 ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
 
                 # Extract answer from content if it has think/answer tags
                 if "Therefore the final answer is:" in content:
-                    content_match = re.search(r"<answer>Therefore the final answer is: (.*?)</answer>", content)
+                    content_match = re.search(r"<answer>Therefore the final answer is: (.*?)</answer>", content, re.DOTALL)
                 else:
-                    content_match = re.search(r"<answer>(.*?)</answer>", content)
+                    content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
 
                 student_answer = content_match.group(1).strip() if content_match else content.strip()
 

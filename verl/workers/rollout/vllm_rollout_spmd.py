@@ -290,7 +290,7 @@ class vLLMRollout(BaseRollout):
                 pred_answers = []
 
                 for response in responses:
-                    content_match = re.search(r"<answer>(.*?)</answer>", response)
+                    content_match = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL)
                     if content_match:
                         pred_answers.append(content_match.group(1).strip())
                     else:
