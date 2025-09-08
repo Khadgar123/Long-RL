@@ -70,6 +70,11 @@ def sde_step_with_logprob(
     std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma)))*0.7
     
     # our sde
+    if std_dev_t.size(0) != 1:
+        std_dev_t= std_dev_t.unsqueeze(-1)  
+        dt= dt.unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1)
+    
     prev_sample_mean = sample*(1+std_dev_t**2/(2*sigma)*dt)+model_output*(1+std_dev_t**2*(1-sigma)/(2*sigma))*dt
     
     if prev_sample is not None and generator is not None:
@@ -101,6 +106,8 @@ def sde_step_with_logprob(
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
     
     return prev_sample, log_prob, prev_sample_mean, std_dev_t * torch.sqrt(-1*dt)
+
+
 
 
 @torch.no_grad()

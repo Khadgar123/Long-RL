@@ -381,6 +381,8 @@ def compute_policy_loss(
             a float number indicating the mean entropy loss
 
     """
+    if log_probs.size(0) != 0:
+        log_probs = log_probs.unsqueeze(-1)  # ensure log_probs is of shape (bs, response_length, 1)
     negative_approx_kl = log_probs - old_log_probs
     # clamp negative_approx_kl to avoid nan kld
     negative_approx_kl = torch.clamp(negative_approx_kl, -20.0, 20.0)
