@@ -266,13 +266,11 @@ Please consider to cite our paper and this framework, if they are helpful in you
 }
 ```
 ```bibtex
-@article{chen2025longvila-r1,
+@inproceedings{chen2025longvila-r1,
       title={Scaling RL to Long Videos},
       author={Yukang Chen and Wei Huang and Baifeng Shi and Qinghao Hu and Hanrong Ye and Ligeng Zhu and Zhijian Liu and Pavlo Molchanov and Jan Kautz and Xiaojuan Qi and Sifei Liu and Hongxu Yin and Yao Lu and Song Han},
+      booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
       year={2025},
-      eprint={2507.07966},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
 }
 ```
 ```bibtex
