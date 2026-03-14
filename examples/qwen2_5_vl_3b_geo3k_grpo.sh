@@ -14,4 +14,4 @@ python3 -m verl.trainer.main \
     worker.rollout.tensor_parallel_size=1 \
     trainer.experiment_name=qwen2_5_vl_3b_geo_grpo \
     trainer.n_gpus_per_node=2 \
-    trainer.logger="console,tensorboard"  # 添加这行
+    'trainer.logger=[console,tensorboard]' 
