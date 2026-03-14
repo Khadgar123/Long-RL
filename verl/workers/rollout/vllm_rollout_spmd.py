@@ -282,6 +282,8 @@ class vLLMRollout(BaseRollout):
                     batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
                 if len(batch_multi_modal_embeds) > 0:
                     batch_multi_modal_embeds = _repeat_interleave(batch_multi_modal_embeds, self.sampling_params.n)
+            else:
+                ground_truth = non_tensor_batch["ground_truth"]
 
             if self.open_ended_reward:
                 responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
