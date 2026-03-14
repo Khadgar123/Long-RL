@@ -498,7 +498,7 @@ class RayPPOTrainer:
             else:
                 test_gen_batch = test_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "ground_truth"],
                 )
                 repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
                 test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
