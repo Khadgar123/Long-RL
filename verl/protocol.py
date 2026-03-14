@@ -89,14 +89,20 @@ def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> Ten
             f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
         )
 
+    # When tensor_dict1 is locked, we need to create a new TensorDict with updated values
+    if tensor_dict1.is_locked:
+        # Start with tensor_dict2 which contains all keys from both
+        result = tensor_dict2.clone()
+        # Add keys from tensor_dict1 that don't exist in tensor_dict2
+        for key in tensor_dict1.keys():
+            if key not in result:
+                result[key] = tensor_dict1[key]
+        return result
+    
     for key in tensor_dict2.keys():
         if key in tensor_dict1 and not torch.equal(tensor_dict1[key], tensor_dict2[key]):
             raise ValueError(f"Key already exists: {key}.")
-
-        if tensor_dict1.is_locked:
-            tensor_dict1.set_(key, tensor_dict2[key])
-        else:
-            tensor_dict1[key] = tensor_dict2[key]
+        tensor_dict1[key] = tensor_dict2[key]
 
     return tensor_dict1
 
