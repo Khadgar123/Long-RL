@@ -25,7 +25,7 @@ python3 -m verl.trainer.main \
     worker.reward.reward_type=sequential \
     worker.reward.reward_function=./examples/reward_function/r1v.py:compute_score \
     trainer.experiment_name=qwen2_5_vl_3b_video_grpo \
-    trainer.n_gpus_per_node=5 \
+    trainer.n_gpus_per_node=4 \
     trainer.val_before_train=false \
     trainer.val_freq=-1
 
