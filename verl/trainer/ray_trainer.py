@@ -14,7 +14,13 @@
 # limitations under the License.
 """
 FSDP PPO Trainer with Ray-based single controller.
-This trainer supports model-agonistic model initialization with huggingface
+基于 Ray 单控制器的 FSDP PPO 训练器。
+该训练器支持使用 huggingface 模型进行模型无关的初始化。
+
+核心架构:
+- Ray 单控制器: 驱动进程通过 RPC 调用 Worker Group 的计算函数
+- Worker Group: 分布在多个 GPU 上的 Worker 进程组
+- 角色: Actor(训练), Rollout(推理), Critic(价值函数), RefPolicy(参考策略)
 """
 
 import json
@@ -52,7 +58,17 @@ from .metrics import compute_data_metrics, compute_throughout_metrics, compute_t
 
 class Role(IntEnum):
     """
-    To create more roles dynamically, you can subclass Role and add new members
+    定义分布式训练中的 Worker 角色。
+    可以在单 GPU 上共存多个角色以节省显存（colocated）。
+
+    角色说明:
+    - Actor: 策略模型，负责训练更新
+    - Rollout: 生成模型，负责采样 responses
+    - ActorRollout: 合并的 Actor + Rollout
+    - Critic: 价值函数，用于 GAE  advantage 估计
+    - RefPolicy: 参考策略，用于计算 KL 散度
+    - RewardModel: 奖励模型
+    - ActorRolloutRef: 合并的 Actor + Rollout + Ref（典型配置）
     """
 
     Actor = auto()
@@ -67,11 +83,18 @@ class Role(IntEnum):
 @dataclass
 class ResourcePoolManager:
     """
-    Define a resource pool specification. Resource pool will be initialized first.
+    资源池管理器，定义分布式训练的资源分配规格。
+    每个资源池包含多个 GPU 节点，每个节点有若干 GPU。
+
+    示例:
+        resource_pool_spec = {
+            "pool1": [8],     # 1个节点，8个GPU
+            "pool2": [4, 4],  # 2个节点，每个4个GPU
+        }
     """
 
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
+    resource_pool_spec: dict[str, list[int]]  # 资源池规格: {pool_name: [每节点GPU数]}
+    mapping: dict[Role, str]                   # 角色到资源池的映射
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
@@ -103,46 +126,73 @@ class ResourcePoolManager:
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
+    """
+    应用 KL 惩罚，将 KL 散度作为负奖励加入最终奖励。
+
+    作用:
+    - 防止策略更新过快，保持与参考策略的相似性
+    - KL 散度越大，惩罚越大
+
+    公式:
+        token_level_rewards = token_level_scores - kl_coef * KL(old || ref)
+    """
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
     response_mask = data.batch["response_mask"]
 
-    # compute kl between ref_policy and current policy
+    # 计算参考策略和当前策略之间的 KL 散度
     kld = compute_kl(data.batch["old_log_probs"], data.batch["ref_log_probs"], kl_penalty=kl_penalty)
-    kld = kld * response_mask  # (batch_size, response_length)
+    kld = kld * response_mask  # 只计算 response 部分的 KL
 
+    # 奖励 = 原始分数 - KL系数 * KL散度
     data.batch["token_level_rewards"] = token_level_scores - kl_ctrl.kl_coef * kld
 
-    current_kl = VF.masked_mean(kld, mask=response_mask, dim=-1)  # average over sequence
+    # 计算平均 KL（用于监控）
+    current_kl = VF.masked_mean(kld, mask=response_mask, dim=-1)
     current_kl = torch.mean(current_kl, dim=0).item()
     metrics = {"critic/kl": current_kl, "critic/kl_coef": kl_ctrl.kl_coef}
 
-    # According to https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L880
+    # 动态调整 KL 系数（自适应控制）
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     return data, metrics
 
 
 def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0):
+    """
+    计算 Advantage（优势）和 Return（回报）。
+
+    Advantage 估计算法:
+    - GAE: Generalized Advantage Estimation，需要 Critic 预测的 value
+    - GRPO: Group Relative Policy Optimization，同一 prompt 生成的多个 response 之间比较
+    - REINFORCE++: 增强版 REINFORCE，使用 gamma 折扣作为 baseline
+    - RLOO: REINFORCE with Leave-One-Out Baseline，使用其他样本的均值作为 baseline
+    - REMAX: 使用 max(response rewards) 作为 baseline
+    """
     token_level_rewards = data.batch["token_level_rewards"]
     response_mask = data.batch["response_mask"]
     index = data.non_tensor_batch["uid"]
     if adv_estimator == AdvantageEstimator.GAE:
+        # GAE: 需要 Critic 预测的价值函数
         values = data.batch["values"]
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards, values, response_mask, gamma, lam
         )
     elif adv_estimator == AdvantageEstimator.GRPO:
+        # GRPO: 按组归一化，同 prompt 的 response 为一组
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS:
+        # REINFORCE++: 使用 gamma 折扣作为 baseline
         advantages, returns = core_algos.compute_reinforce_plus_plus_outcome_advantage(
             token_level_rewards, response_mask, gamma
         )
     elif adv_estimator == AdvantageEstimator.REMAX:
+        # REMAX: 使用 batch 中最大 reward 作为 baseline
         reward_baselines = data.batch["reward_baselines"]
         advantages, returns = core_algos.compute_remax_outcome_advantage(
             token_level_rewards, reward_baselines, response_mask
         )
     elif adv_estimator == AdvantageEstimator.RLOO:
+        # RLOO: Leave-One-Out，使用其他样本均值作为 baseline
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards, response_mask, index)
     else:
         raise NotImplementedError
@@ -168,7 +218,22 @@ def compute_advantage_diffusion(data: DataProto, adv_estimator: AdvantageEstimat
 
 class RayPPOTrainer:
     """
-    Note that this trainer runs on the driver process on a single CPU/GPU node.
+    基于 Ray 的 PPO 训练器。
+
+    特点:
+    - 单控制器架构: 驱动进程在 CPU 上，负责调度
+    - Worker Group: 多个 GPU 进程执行实际计算
+    - 混合引擎: Actor + Rollout + Ref 合并部署在同 GPU（hybrid_engine=True）
+    - 支持多种 RL 算法: PPO, GRPO, DAPO, REINFORCE++, RLOO, REMAX
+    - 支持多模态: 图像、视频、音频理解
+
+    典型训练流程:
+    1. 生成 (Rollout): 使用当前策略生成 responses
+    2. 奖励 (Reward): 使用奖励函数计算每个 token 的奖励
+    3. 价值 (Value): 使用 Critic 预测价值（仅 GAE）
+    4. Advantage: 计算 advantage 和 return
+    5. 更新 Critic: 训练价值函数（仅 GAE）
+    6. 更新 Actor: 使用 PPO/GRPO 等算法更新策略
     """
 
     def __init__(
@@ -398,8 +463,20 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> Dict[str, Any]:
+        """
+        验证流程。
+
+        步骤:
+        1. 初始化空的奖励列表
+        2. 准备 rollout engine（vLLM）
+        3. 遍历验证集，生成 responses
+        4. 使用奖励函数计算奖励
+        5. 记录验证样本到日志（用于分析）
+        6. 释放 rollout engine
+        7. 返回验证指标
+        """
         reward_tensor_lst = []
-        # Lists to collect samples for the table
+        # 用于收集验证样本（在日志中展示）
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
         reward_metrics_lst = defaultdict(list)
         print("Start validation...")
@@ -480,17 +557,32 @@ class RayPPOTrainer:
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics}
 
     def _balance_batch(self, batch: DataProto, metrics: Dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        """
+        序列长度负载均衡。
+
+        问题: 不同样本的序列长度差异很大，如果直接按顺序分配给各 GPU，
+              会导致部分 GPU 很忙，部分 GPU 很闲。
+
+        解决方案:
+        - 计算每个样本的总 token 数
+        - 按 token 数排序，使用贪心算法分配给各 GPU
+        - 使每个 GPU 处理的总 token 数尽可能均衡
+
+        注意: 这会打乱样本顺序，需要注意 GRPO/RLOO 等按组计算的算法。
+        """
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        # 计算每个样本的总 token 数
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()
         world_size = self.actor_rollout_ref_wg.world_size
+        # 均衡分区，每个 GPU 分配到的样本总 token 数接近
         global_partition_lst = get_seqlen_balanced_partitions(
             global_seqlen_lst, k_partitions=world_size, equal_size=True
         )
-        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        # 按索引重新排序，数据会自动被 dispatch 到各 GPU
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
+        # 记录负载均衡统计信息
         global_balance_stats = log_seqlen_unbalance(
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
@@ -541,18 +633,20 @@ class RayPPOTrainer:
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
             )
-            # repeat to align with repeated responses in rollout
+            # 为每个 prompt 生成 n 个 responses（n = rollout.n）
+            # repeat n 次后，每个原始 prompt 会有 n 个对应的 response
             if not self.diffusion:
                 new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
             new_batch = new_batch.union(gen_batch_output)
 
-            # filter group
+            # 在线过滤：根据奖励过滤低质量样本
             if self.config.algorithm.online_filtering:
                 reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
                 new_batch.batch["token_level_scores"] = reward_tensor
                 for k, v in reward_metrics.items():
                     all_metrics[k].extend(v)
 
+                # 按 uid（原始 prompt）分组，计算每组平均分
                 filter_scores = reward_metrics[self.config.algorithm.filter_key]
                 uids = new_batch.non_tensor_batch["uid"]
                 uid2scores = defaultdict(list)
@@ -560,6 +654,7 @@ class RayPPOTrainer:
                     uid2scores[uid].append(score)
 
                 uid2mean = {uid: np.mean(scores) for uid, scores in uid2scores.items()}
+                # 只保留平均分在 [filter_low, filter_high] 范围内的样本
                 kept_uids = [
                     uid
                     for uid, avg_score in uid2mean.items()
@@ -569,6 +664,7 @@ class RayPPOTrainer:
                 if len(kept_sample_idxs) > 0:
                     new_batch = new_batch[kept_sample_idxs]
 
+            # 拼接多个 mini-batch（可能需要多次采样才能达到目标 batch size）
             batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
             current_batch_size = len(batch) // self.config.worker.rollout.n
             rollout_batch_size = self.config.data.rollout_batch_size
@@ -590,9 +686,35 @@ class RayPPOTrainer:
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        PPO 训练循环。
+
+        驱动进程只需要通过 RPC 调用 Worker Group 的计算函数来构建 PPO 数据流。
+        轻量级的 advantage 计算在驱动进程上完成。
+
+        完整训练流程:
+        ┌─────────────────────────────────────────────────────────┐
+        │  1. _make_batch_data()     - 采样数据，生成 responses   │
+        │          ↓                                            │
+        │  2. _balance_batch()       - 序列长度负载均衡           │
+        │          ↓                                            │
+        │  3. compute_reward()       - 计算奖励                  │
+        │          ↓                                            │
+        │  4. compute_log_probs()     - 计算旧策略的 log_prob     │
+        │          ↓                                            │
+        │  5. compute_ref_log_probs()- 计算参考策略的 log_prob   │
+        │          ↓                                            │
+        │  6. compute_values()       - 计算价值（仅 GAE）        │
+        │          ↓                                            │
+        │  7. compute_advantage()    - 计算 advantage 和 return  │
+        │          ↓                                            │
+        │  8. update_critic()        - 更新 Critic（仅 GAE）      │
+        │          ↓                                            │
+        │  9. update_actor()         - 更新 Actor                │
+        │          ↓                                            │
+        │ 10. _validate()            - 验证（可选）              │
+        │          ↓                                            │
+        │ 11. _save_checkpoint()     - 保存 checkpoint           │
+        └─────────────────────────────────────────────────────────┘
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
@@ -617,64 +739,69 @@ class RayPPOTrainer:
 
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
-                # make a batch of data
+                # ===== 1. 生成 (Rollout): 使用当前策略生成 responses =====
                 with timer("gen", timing_raw):
                     if not self.diffusion:
+                        # 准备 vLLM 推理引擎
                         self.actor_rollout_ref_wg.prepare_rollout_engine()
                         batch = self._make_batch_data(metrics=metrics)
+                        # 释放 vLLM 引擎，释放显存
                         self.actor_rollout_ref_wg.release_rollout_engine()
                     else:
                         batch = self._make_batch_data(metrics=metrics)
-                # balance the number of valid tokens on each dp rank.
-                # NOTE: this breaks the order of data inside the batch.
-                # Please take care when you implement group based adv computation such as GRPO and rloo
+
+                # ===== 2. 序列长度负载均衡 =====
+                # NOTE: 这会打乱样本顺序，需要注意 GRPO/RLOO 等按组计算的算法
                 if not self.diffusion:
                     self._balance_batch(batch, metrics=metrics)
-                    # compute global valid tokens
+                    # 记录全局有效 token 数
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                # compute reward
+                # ===== 3. 计算奖励 =====
                 if not self.diffusion:
                     if "token_level_scores" not in batch.batch:
                         with timer("reward", timing_raw):
+                            # 异步计算奖励
                             reward_ref = self.reward_fn.compute_reward.remote(batch)
                 else:
                     reward_ref = self.reward_fn.compute_reward.remote(batch)
-                # recompute old_log_probs
+
+                # ===== 4. 重新计算旧策略的 log_prob =====
                 if not self.diffusion:
                     with timer("old", timing_raw):
+                        # 计算生成 responses 时的 log probability（用于 PPO 裁剪）
                         old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                         batch = batch.union(old_log_probs)
 
-                # compute ref_log_probs
+                # ===== 5. 计算参考策略的 log_prob（用于 KL 惩罚）=====
                 if self.use_reference_policy:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
 
-                # compute values
+                # ===== 6. 计算价值（仅 GAE 算法需要）=====
                 if self.use_critic:
                     with timer("values", timing_raw):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
 
+                # ===== 7. 计算 Advantage 和 Return =====
                 with timer("adv", timing_raw):
                     if "token_level_scores" not in batch.batch:
-                        # get token level scores asynchronously
+                        # 异步获取奖励
                         reward_tensor, reward_metrics = ray.get(reward_ref)
                         batch.batch["token_level_scores"] = reward_tensor
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
 
-                    # apply kl penalty if available
+                    # 应用 KL 惩罚（如果启用）
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
                         batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
                         metrics.update(kl_metrics)
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
+                    # 计算 advantage，在驱动进程上执行（轻量级）
                     compute_advantage_func = compute_advantage_diffusion if self.diffusion else compute_advantage
                     batch = compute_advantage_func(
                         batch,
@@ -683,7 +810,7 @@ class RayPPOTrainer:
                         lam=self.config.algorithm.lam,
                     )
 
-                # update critic
+                # ===== 8. 更新 Critic（仅 GAE 算法）=====
                 if self.use_critic:
                     with timer("update_critic", timing_raw):
                         critic_output = self.critic_wg.update_critic(batch)
@@ -691,7 +818,7 @@ class RayPPOTrainer:
                     critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
                     metrics.update(critic_metrics)
 
-                # update actor
+                # ===== 9. 更新 Actor（策略模型）=====
                 if self.config.trainer.critic_warmup <= self.global_step:
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
@@ -699,7 +826,7 @@ class RayPPOTrainer:
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
 
-                # validate
+                # ===== 10. 验证 =====
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.val_freq > 0
@@ -710,6 +837,7 @@ class RayPPOTrainer:
 
                     metrics.update(val_metrics)
 
+                # ===== 11. 保存 Checkpoint =====
                 if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()

@@ -14,4 +14,5 @@ python3 -m verl.trainer.main \
     data.rollout_batch_size=32 \
     worker.actor.global_batch_size=32 \
     worker.actor.model.model_path=${MODEL_PATH} \
-    trainer.experiment_name=qwen3_4b_math_grpo
+    trainer.experiment_name=qwen3_4b_math_grpo \
+    trainer.logger="console,tensorboard"  # 添加这行
