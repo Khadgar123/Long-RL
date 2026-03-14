@@ -29,7 +29,7 @@ if is_package_available("mlflow"):
     import mlflow  # type: ignore
 
 
-if is_package_available("tensorboard"):
+if is_package_available("tensorboard") or is_package_available("torch.utils.tensorboard"):
     from torch.utils.tensorboard import SummaryWriter
 
 
@@ -94,6 +94,8 @@ class SwanlabLogger(Logger):
 
 class TensorBoardLogger(Logger):
     def __init__(self, config: Dict[str, Any]) -> None:
+        from torch.utils.tensorboard import SummaryWriter
+        
         tensorboard_dir = os.getenv("TENSORBOARD_DIR", "tensorboard_log")
         tensorboard_dir = os.path.join(
             tensorboard_dir, config["trainer"]["project_name"], config["trainer"]["experiment_name"]
